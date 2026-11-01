@@ -58,7 +58,7 @@ export default function Layout({ currentUser, onLogout }) {
 
       {/* Main Content */}
       <main className="flex-1 overflow-y-auto w-full">
-        <Outlet />
+        <Outlet context={{ currentUser }} />
       </main>
     </div>
   );

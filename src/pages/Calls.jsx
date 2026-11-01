@@ -1,15 +1,38 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Phone, PhoneCall, PhoneOff, Mic, RadioTower, AlertTriangle } from 'lucide-react';
+import { useOutletContext } from 'react-router-dom';
+import { Phone, PhoneCall, PhoneOff, Mic, MicOff, RadioTower, AlertTriangle, Volume2 } from 'lucide-react';
 import { supabase } from '../supabaseClient';
-import { getStoredUserId } from '../utils/session';
 import { getTowerForUser } from '../utils/network';
 
 const ACTIVE_CALL_STATUSES = ['pending', 'connecting', 'connected'];
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+const RING_TIMEOUT_MS = 45000;
+const STALE_INCOMING_MS = 90000;
+const ICE_GATHER_TIMEOUT_MS = 4000;
+
+// STUN is enough for calls on the same machine / same network. Calls across
+// different networks (mobile data, strict NAT) also need a TURN relay, which
+// can be configured through VITE_TURN_* env vars (see .env.example).
+const TURN_URLS = import.meta.env.VITE_TURN_URLS;
+const HAS_TURN = Boolean(TURN_URLS);
+const ICE_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+  ...(HAS_TURN
+    ? [
+        {
+          urls: TURN_URLS.split(',').map((url) => url.trim()).filter(Boolean),
+          username: import.meta.env.VITE_TURN_USERNAME,
+          credential: import.meta.env.VITE_TURN_CREDENTIAL,
+        },
+      ]
+    : []),
+];
 
 function getErrorMessage(error) {
   if (!error) return '';
   if (typeof error === 'string') return error;
+  if (error.name === 'NotAllowedError') return 'Microphone permission was denied. Allow mic access in the browser and try again.';
+  if (error.name === 'NotFoundError') return 'No microphone was found on this device.';
+  if (error.name === 'NotReadableError') return 'The microphone is in use by another application.';
   return error.message || 'Unknown error';
 }
 
@@ -22,20 +45,113 @@ function formatParticipant(user) {
   return `${user.username} (${user.phone_number}) • ${tower.name}`;
 }
 
+// Non-trickle ICE: wait until candidates are gathered so the full route list
+// travels inside the offer/answer SDP stored on the call row.
+function waitForIceGathering(peer) {
+  if (peer.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      peer.removeEventListener('icegatheringstatechange', handleChange);
+      resolve();
+    };
+    const handleChange = () => {
+      if (peer.iceGatheringState === 'complete') finish();
+    };
+    const timer = setTimeout(finish, ICE_GATHER_TIMEOUT_MS);
+    peer.addEventListener('icegatheringstatechange', handleChange);
+  });
+}
+
+async function markCall(callId, fields) {
+  const { error } = await supabase.from('calls').update(fields).eq('id', callId);
+  if (error) console.error(error);
+}
+
+function useAudioLevel(stream) {
+  const [level, setLevel] = useState(0);
+
+  useEffect(() => {
+    if (!stream || stream.getAudioTracks().length === 0) return undefined;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return undefined;
+
+    const context = new AudioContextClass();
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    let frame;
+
+    const tick = () => {
+      analyser.getByteTimeDomainData(samples);
+      let sum = 0;
+      for (const sample of samples) {
+        const normalized = (sample - 128) / 128;
+        sum += normalized * normalized;
+      }
+      const nextLevel = Math.round(Math.min(1, Math.sqrt(sum / samples.length) * 5) * 20) / 20;
+      setLevel((previous) => (previous === nextLevel ? previous : nextLevel));
+      frame = requestAnimationFrame(tick);
+    };
+
+    context.resume().catch(() => {});
+    tick();
+
+    return () => {
+      cancelAnimationFrame(frame);
+      source.disconnect();
+      context.close().catch(() => {});
+    };
+  }, [stream]);
+
+  return stream ? level : 0;
+}
+
+function LevelMeter({ label, level, muted }) {
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between text-xs text-neutral-400">
+        <span>{label}</span>
+        <span>{muted ? 'muted' : level > 0.05 ? 'signal' : 'silent'}</span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-neutral-800">
+        <div
+          className="h-full rounded-full bg-emerald-500 transition-[width] duration-75"
+          style={{ width: `${muted ? 0 : Math.round(level * 100)}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function Calls() {
-  const currentUserId = getStoredUserId();
+  const { currentUser: sessionUser } = useOutletContext() || {};
+  const currentUserId = sessionUser?.id ?? null;
+
   const [users, setUsers] = useState([]);
-  const [callState, setCallState] = useState(null);
+  const [activeCall, setActiveCall] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
   const [selectedUserId, setSelectedUserId] = useState('');
   const [statusText, setStatusText] = useState('Idle and ready for a voice session.');
+  const [connectionState, setConnectionState] = useState('idle');
   const [setupError, setSetupError] = useState('');
   const [isBusy, setIsBusy] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
 
   const peerRef = useRef(null);
   const localStreamRef = useRef(null);
-  const processedCandidateIdsRef = useRef(new Set());
   const remoteAudioRef = useRef(null);
+  const activeCallRef = useRef(null);
+  const incomingCallRef = useRef(null);
+  const realtimeHandlerRef = useRef(null);
+
+  const localLevel = useAudioLevel(localStream);
+  const remoteLevel = useAudioLevel(remoteStream);
 
   const currentUser = useMemo(() => users.find((user) => user.id === currentUserId) || null, [users, currentUserId]);
   const selectedUser = useMemo(
@@ -43,173 +159,211 @@ export default function Calls() {
     [users, selectedUserId]
   );
 
-  const releaseMedia = () => {
+  const updateActiveCall = (call) => {
+    activeCallRef.current = call;
+    setActiveCall(call);
+  };
+
+  const updateIncomingCall = (call) => {
+    incomingCallRef.current = call;
+    setIncomingCall(call);
+  };
+
+  const teardownMedia = () => {
+    const peer = peerRef.current;
+    if (peer) {
+      peer.ontrack = null;
+      peer.onconnectionstatechange = null;
+      peer.close();
+      peerRef.current = null;
+    }
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
     }
 
-    if (peerRef.current) {
-      peerRef.current.close();
-      peerRef.current = null;
-    }
-
-    processedCandidateIdsRef.current = new Set();
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
     }
+
+    setLocalStream(null);
+    setRemoteStream(null);
+    setIsMuted(false);
+    setAudioBlocked(false);
+    setConnectionState('idle');
   };
 
-  const fetchUsers = async () => {
-    const { data, error } = await supabase.from('users').select('id, username, phone_number').order('id');
-    if (error) throw error;
-    const filtered = (data || []).filter((user) => user.id !== currentUserId);
-    setUsers(data || []);
-    if (!selectedUserId && filtered.length > 0) {
-      setSelectedUserId(String(filtered[0].id));
+  const finishCall = async (status, message) => {
+    const call = activeCallRef.current;
+    updateActiveCall(null);
+    teardownMedia();
+    setStatusText(message);
+    if (call) {
+      await markCall(call.id, { status, ended_at: new Date().toISOString() });
     }
   };
 
-  const fetchCallState = async () => {
-    const { data, error } = await supabase
-      .from('calls')
-      .select('*')
-      .or(`caller_id.eq.${currentUserId},receiver_id.eq.${currentUserId}`)
-      .in('status', ACTIVE_CALL_STATUSES)
-      .order('started_at', { ascending: false });
-
-    if (error) throw error;
-
-    const allCalls = data || [];
-    const nextIncoming =
-      allCalls.find(
-        (call) =>
-          call.receiver_id === currentUserId &&
-          !call.answer &&
-          ['pending', 'connecting'].includes(call.status)
-      ) || null;
-
-    const activeCall =
-      allCalls.find((call) => call.id === nextIncoming?.id) ||
-      allCalls.find((call) => call.caller_id === currentUserId || call.receiver_id === currentUserId) ||
-      null;
-
-    setCallState(activeCall);
-    setIncomingCall(nextIncoming);
-  };
-
-  const ensureLocalStream = async () => {
-    if (localStreamRef.current) return localStreamRef.current;
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  const openMicrophone = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Microphone access requires HTTPS or localhost.');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
     localStreamRef.current = stream;
+    setLocalStream(stream);
     return stream;
   };
 
-  const createPeerConnection = async (callId) => {
-    if (peerRef.current) {
-      peerRef.current.close();
+  const playRemoteAudio = () => {
+    const audioElement = remoteAudioRef.current;
+    if (!audioElement) return;
+    audioElement.muted = false;
+    audioElement
+      .play()
+      .then(() => setAudioBlocked(false))
+      .catch(() => setAudioBlocked(true));
+  };
+
+  const handleConnectionState = (peer) => {
+    if (peerRef.current !== peer) return;
+    const state = peer.connectionState;
+    setConnectionState(state);
+
+    if (state === 'connecting') {
+      setStatusText('Negotiating audio path...');
+    } else if (state === 'connected') {
+      setStatusText('Voice link connected. You can speak now.');
+      const call = activeCallRef.current;
+      if (call && call.status !== 'connected') {
+        markCall(call.id, { status: 'connected', answered_at: call.answered_at || new Date().toISOString() });
+      }
+    } else if (state === 'disconnected') {
+      setStatusText('Connection interrupted, trying to recover...');
+    } else if (state === 'failed') {
+      finishCall(
+        'ended',
+        HAS_TURN
+          ? 'Could not establish an audio path between the two devices.'
+          : 'Could not establish an audio path. The devices are probably on different networks and need a TURN server (see .env.example).'
+      );
     }
+  };
 
+  const createPeer = (stream) => {
     const peer = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const stream = await ensureLocalStream();
-
     stream.getTracks().forEach((track) => peer.addTrack(track, stream));
 
     peer.ontrack = (event) => {
+      const incomingStream = event.streams[0] || new MediaStream([event.track]);
+      setRemoteStream(incomingStream);
       if (remoteAudioRef.current) {
-        remoteAudioRef.current.srcObject = event.streams[0];
+        remoteAudioRef.current.srcObject = incomingStream;
+        playRemoteAudio();
       }
     };
 
-    peer.onicecandidate = async (event) => {
-      if (!event.candidate) return;
-      await supabase.from('call_candidates').insert([
-        {
-          call_id: callId,
-          user_id: currentUserId,
-          candidate: event.candidate.toJSON(),
-        },
-      ]);
-    };
-
-    peer.onconnectionstatechange = () => {
-      if (peer.connectionState === 'connected') {
-        setStatusText('Voice link connected. You can speak now.');
-      }
-
-      if (['disconnected', 'failed', 'closed'].includes(peer.connectionState)) {
-        setStatusText('Call ended or connection lost.');
-      }
-    };
+    peer.onconnectionstatechange = () => handleConnectionState(peer);
 
     peerRef.current = peer;
-    processedCandidateIdsRef.current = new Set();
     return peer;
   };
 
-  const hydratePeerForCall = async (call) => {
-    if (!call) return;
-    if (peerRef.current && peerRef.current.__callId === call.id) return peerRef.current;
-    const peer = await createPeerConnection(call.id);
-    peer.__callId = call.id;
-    return peer;
-  };
+  const handleRealtimeCall = async (call) => {
+    if (!call || (call.caller_id !== currentUserId && call.receiver_id !== currentUserId)) return;
 
-  const syncCallDescriptions = async (call) => {
-    if (!call) return;
-    const peer = await hydratePeerForCall(call);
-    if (!peer) return;
-
-    if (
-      call.caller_id === currentUserId &&
-      call.answer &&
-      peer.signalingState === 'have-local-offer'
-    ) {
-      await peer.setRemoteDescription(new RTCSessionDescription(call.answer));
-      setStatusText('Receiver joined. Finalizing voice path...');
-      if (call.status !== 'connected') {
-        await supabase.from('calls').update({ status: 'connected', answered_at: new Date().toISOString() }).eq('id', call.id);
+    const current = activeCallRef.current;
+    if (current && call.id === current.id) {
+      if (!ACTIVE_CALL_STATUSES.includes(call.status)) {
+        updateActiveCall(null);
+        teardownMedia();
+        setStatusText(call.status === 'declined' ? 'Call declined.' : 'The other side ended the call.');
+        return;
       }
-    }
 
-    if (
-      call.receiver_id === currentUserId &&
-      call.offer &&
-      peer.signalingState === 'stable' &&
-      !peer.remoteDescription
-    ) {
-      await peer.setRemoteDescription(new RTCSessionDescription(call.offer));
-    }
-  };
+      updateActiveCall(call);
 
-  const fetchAndApplyCandidates = async (callId) => {
-    if (!callId || !peerRef.current) return;
-
-    const { data, error } = await supabase
-      .from('call_candidates')
-      .select('*')
-      .eq('call_id', callId)
-      .neq('user_id', currentUserId)
-      .order('id');
-
-    if (error) throw error;
-
-    for (const candidateRow of data || []) {
-      if (processedCandidateIdsRef.current.has(candidateRow.id)) continue;
-      try {
-        await peerRef.current.addIceCandidate(new RTCIceCandidate(candidateRow.candidate));
-        processedCandidateIdsRef.current.add(candidateRow.id);
-      } catch (candidateError) {
-        console.error(candidateError);
+      const peer = peerRef.current;
+      if (call.caller_id === currentUserId && call.answer && peer?.signalingState === 'have-local-offer') {
+        setStatusText('Receiver joined. Connecting audio...');
+        try {
+          await peer.setRemoteDescription(call.answer);
+        } catch (error) {
+          finishCall('ended', getErrorMessage(error));
+        }
       }
+      return;
+    }
+
+    const ringing = incomingCallRef.current;
+    if (ringing && call.id === ringing.id && !ACTIVE_CALL_STATUSES.includes(call.status)) {
+      updateIncomingCall(null);
+      setStatusText('Missed call: the caller hung up.');
+      return;
+    }
+
+    if (call.receiver_id === currentUserId && call.status === 'pending' && call.offer && !call.answer && !current) {
+      updateIncomingCall(call);
+      setStatusText('Incoming call ready to join.');
     }
   };
+
+  realtimeHandlerRef.current = handleRealtimeCall;
 
   useEffect(() => {
+    if (!currentUserId) return undefined;
+    let cancelled = false;
+
     const bootstrap = async () => {
       try {
-        await fetchUsers();
-        await fetchCallState();
+        const { data: userRows, error: usersError } = await supabase
+          .from('users')
+          .select('id, username, phone_number')
+          .order('id');
+        if (usersError) throw usersError;
+        if (cancelled) return;
+
+        setUsers(userRows || []);
+        const firstOther = (userRows || []).find((user) => user.id !== currentUserId);
+        setSelectedUserId((previous) => previous || (firstOther ? String(firstOther.id) : ''));
+
+        const { data: openCalls, error: callsError } = await supabase
+          .from('calls')
+          .select('*')
+          .or(`caller_id.eq.${currentUserId},receiver_id.eq.${currentUserId}`)
+          .in('status', ACTIVE_CALL_STATUSES)
+          .order('started_at', { ascending: false });
+        if (callsError) throw callsError;
+
+        // Peer connections don't survive a page reload, so any open call we
+        // placed or already answered is dead. Only a fresh ringing call is kept.
+        const now = Date.now();
+        let ringingCall = null;
+        const staleIds = [];
+        for (const call of openCalls || []) {
+          const isFreshIncoming =
+            call.receiver_id === currentUserId &&
+            call.status === 'pending' &&
+            call.offer &&
+            !call.answer &&
+            now - Date.parse(call.started_at) < STALE_INCOMING_MS;
+          if (isFreshIncoming && !ringingCall) {
+            ringingCall = call;
+          } else {
+            staleIds.push(call.id);
+          }
+        }
+
+        if (staleIds.length > 0) {
+          await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).in('id', staleIds);
+        }
+
+        if (!cancelled && ringingCall && !activeCallRef.current) {
+          updateIncomingCall(ringingCall);
+          setStatusText('Incoming call ready to join.');
+        }
       } catch (error) {
         const message = getErrorMessage(error);
         if (isMissingCallSchema(message)) {
@@ -223,155 +377,160 @@ export default function Calls() {
     bootstrap();
 
     const callsChannel = supabase
-      .channel(`calls-realtime-${currentUserId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'calls' }, async () => {
-        await fetchCallState();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'call_candidates' }, async (payload) => {
-        if (payload.new?.call_id === callState?.id || payload.old?.call_id === callState?.id) {
-          await fetchAndApplyCandidates(callState?.id);
-        }
+      .channel(`calls-realtime-${currentUserId}-${Math.random().toString(36).slice(2)}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'calls' }, (payload) => {
+        realtimeHandlerRef.current?.(payload.new);
       })
       .subscribe();
 
     return () => {
+      cancelled = true;
       supabase.removeChannel(callsChannel);
-      releaseMedia();
     };
-  }, [currentUserId, callState?.id]);
+  }, [currentUserId]);
 
+  // Hang up when leaving the page.
+  useEffect(
+    () => () => {
+      const call = activeCallRef.current;
+      if (call) {
+        markCall(call.id, { status: 'ended', ended_at: new Date().toISOString() });
+        activeCallRef.current = null;
+      }
+      teardownMedia();
+    },
+    []
+  );
+
+  // Stop ringing if nobody answers.
   useEffect(() => {
-    if (!callState) {
-      releaseMedia();
-      return;
-    }
-
-    syncCallDescriptions(callState).then(() => fetchAndApplyCandidates(callState.id)).catch((error) => {
-      setStatusText(getErrorMessage(error));
-    });
-
-      if (callState.receiver_id === currentUserId && !callState.answer) {
-        setStatusText('Incoming call ready to join.');
-      } else if (callState.status === 'pending') {
-        setStatusText(callState.caller_id === currentUserId ? 'Calling... waiting for the other user to join.' : 'Incoming call ready to join.');
-      } else if (callState.status === 'connected') {
-        setStatusText('Voice link connected. You can speak now.');
-    } else if (callState.status === 'connecting') {
-      setStatusText('Connecting voice session...');
-    }
-  }, [callState, currentUserId]);
+    if (!activeCall || activeCall.status !== 'pending' || activeCall.caller_id !== currentUserId) return undefined;
+    const callId = activeCall.id;
+    const timer = setTimeout(() => {
+      const current = activeCallRef.current;
+      if (current?.id === callId && current.status === 'pending') {
+        finishCall('ended', 'No answer.');
+      }
+    }, RING_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [activeCall?.id, activeCall?.status, currentUserId]);
 
   const handleStartCall = async () => {
-    if (!selectedUserId) return;
+    if (!selectedUser || activeCallRef.current) return;
     setIsBusy(true);
+    setStatusText('Opening microphone...');
     try {
+      const stream = await openMicrophone();
+      const peer = createPeer(stream);
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      setStatusText('Gathering network routes...');
+      await waitForIceGathering(peer);
+      if (peerRef.current !== peer) return;
+
       const { data: insertedCall, error: insertError } = await supabase
         .from('calls')
         .insert([
           {
             caller_id: currentUserId,
-            receiver_id: Number(selectedUserId),
+            receiver_id: selectedUser.id,
             status: 'pending',
+            offer: peer.localDescription.toJSON(),
           },
         ])
         .select()
         .single();
-
       if (insertError) throw insertError;
 
-      const peer = await createPeerConnection(insertedCall.id);
-      peer.__callId = insertedCall.id;
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-
-      const { data: updatedCall, error: updateError } = await supabase
-        .from('calls')
-        .update({ offer, status: 'pending' })
-        .eq('id', insertedCall.id)
-        .select()
-        .single();
-
-      if (updateError) throw updateError;
-
-      setCallState(updatedCall);
-      setStatusText(`Calling ${selectedUser?.username || 'receiver'}... waiting for join.`);
+      updateActiveCall(insertedCall);
+      setStatusText(`Ringing ${selectedUser.username}... waiting for them to join.`);
     } catch (error) {
-      setStatusText(getErrorMessage(error));
+      await finishCall('ended', getErrorMessage(error));
     } finally {
       setIsBusy(false);
     }
   };
 
   const handleJoinCall = async () => {
-    if (!incomingCall) return;
+    const ringing = incomingCallRef.current;
+    if (!ringing) return;
     setIsBusy(true);
     try {
       const { data: latestCall, error: latestCallError } = await supabase
         .from('calls')
         .select('*')
-        .eq('id', incomingCall.id)
+        .eq('id', ringing.id)
         .single();
-
       if (latestCallError) throw latestCallError;
-      if (!latestCall?.offer) {
-        setStatusText('Caller is still preparing the voice offer. Try Join again in a second.');
+
+      if (!ACTIVE_CALL_STATUSES.includes(latestCall.status) || !latestCall.offer) {
+        updateIncomingCall(null);
+        setStatusText('This call is no longer available.');
         return;
       }
 
-      const peer = await createPeerConnection(latestCall.id);
-      peer.__callId = latestCall.id;
-      await peer.setRemoteDescription(new RTCSessionDescription(latestCall.offer));
+      setStatusText('Opening microphone...');
+      const stream = await openMicrophone();
+      const peer = createPeer(stream);
+      updateIncomingCall(null);
+      updateActiveCall(latestCall);
+
+      await peer.setRemoteDescription(latestCall.offer);
       const answer = await peer.createAnswer();
       await peer.setLocalDescription(answer);
+      setStatusText('Gathering network routes...');
+      await waitForIceGathering(peer);
+      if (peerRef.current !== peer) return;
 
-      const { data: updatedCall, error } = await supabase
+      const { data: updatedCall, error: updateError } = await supabase
         .from('calls')
-        .update({
-          answer,
-          status: 'connected',
-          answered_at: new Date().toISOString(),
-        })
+        .update({ answer: peer.localDescription.toJSON(), status: 'connecting' })
         .eq('id', latestCall.id)
         .select()
         .single();
+      if (updateError) throw updateError;
 
-      if (error) throw error;
-
-      setCallState(updatedCall);
-      setIncomingCall(null);
+      if (activeCallRef.current?.id === updatedCall.id) {
+        updateActiveCall(updatedCall);
+      }
       setStatusText('Joining voice session...');
     } catch (error) {
-      setStatusText(getErrorMessage(error));
+      await finishCall('ended', getErrorMessage(error));
     } finally {
       setIsBusy(false);
     }
   };
 
   const handleDeclineCall = async () => {
-    if (!incomingCall) return;
-    await supabase.from('calls').update({ status: 'declined', ended_at: new Date().toISOString() }).eq('id', incomingCall.id);
-    setIncomingCall(null);
+    const ringing = incomingCallRef.current;
+    if (!ringing) return;
+    updateIncomingCall(null);
     setStatusText('Incoming call declined.');
+    await markCall(ringing.id, { status: 'declined', ended_at: new Date().toISOString() });
   };
 
-  const handleEndCall = async () => {
-    if (!callState) return;
-    await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callState.id);
-    setCallState(null);
-    setIncomingCall(null);
-    releaseMedia();
-    setStatusText('Call ended.');
+  const handleEndCall = () => finishCall('ended', 'Call ended.');
+
+  const handleToggleMute = () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const nextMuted = !isMuted;
+    stream.getAudioTracks().forEach((track) => {
+      track.enabled = !nextMuted;
+    });
+    setIsMuted(nextMuted);
   };
 
-  const otherParticipantId = callState
-    ? callState.caller_id === currentUserId
-      ? callState.receiver_id
-      : callState.caller_id
+  const otherParticipantId = activeCall
+    ? activeCall.caller_id === currentUserId
+      ? activeCall.receiver_id
+      : activeCall.caller_id
     : incomingCall
       ? incomingCall.caller_id
       : null;
 
   const otherParticipant = users.find((user) => user.id === otherParticipantId);
+  const badgeLabel = activeCall ? (connectionState === 'idle' ? activeCall.status : connectionState) : incomingCall ? 'ringing' : 'idle';
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-8 p-8">
@@ -423,11 +582,17 @@ export default function Calls() {
           <button
             type="button"
             onClick={handleStartCall}
-            disabled={!selectedUserId || !!callState || isBusy || !!setupError}
+            disabled={!selectedUser || !!activeCall || !!incomingCall || isBusy || !!setupError}
             className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-5 py-3 font-medium text-white transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-neutral-700"
           >
             <Phone size={18} /> Call {selectedUser?.username || 'User'}
           </button>
+
+          {!HAS_TURN && (
+            <p className="mt-4 text-xs text-neutral-500">
+              No TURN relay configured: calls work on the same machine or network, but may fail across different networks.
+            </p>
+          )}
         </section>
 
         <section className="rounded-3xl border border-neutral-800 bg-neutral-900 p-6">
@@ -438,9 +603,7 @@ export default function Calls() {
                 {otherParticipant ? otherParticipant.username : incomingCall ? 'Incoming Call' : 'No Active Call'}
               </div>
             </div>
-            <div className="rounded-full border border-neutral-700 px-4 py-2 text-sm text-neutral-300">
-              {callState?.status || incomingCall?.status || 'idle'}
-            </div>
+            <div className="rounded-full border border-neutral-700 px-4 py-2 text-sm text-neutral-300">{badgeLabel}</div>
           </div>
 
           <div className="mt-6 rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
@@ -453,7 +616,24 @@ export default function Calls() {
                 ? `Current path: ${currentUser ? formatParticipant(currentUser) : 'Current user'} -> ${formatParticipant(otherParticipant)}`
                 : 'Select a node, place a call, and wait for the other side to join.'}
             </div>
+
+            {activeCall && (
+              <div className="mt-5 space-y-3">
+                <LevelMeter label="Your microphone" level={localLevel} muted={isMuted} />
+                <LevelMeter label={`Audio from ${otherParticipant?.username || 'remote'}`} level={remoteLevel} />
+              </div>
+            )}
           </div>
+
+          {audioBlocked && (
+            <button
+              type="button"
+              onClick={playRemoteAudio}
+              className="mt-6 flex items-center gap-2 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-5 py-3 font-medium text-sky-100 hover:bg-sky-500/20"
+            >
+              <Volume2 size={18} /> Browser blocked playback. Click to enable audio
+            </button>
+          )}
 
           {incomingCall && (
             <div className="mt-6 rounded-2xl border border-sky-500/30 bg-sky-500/10 p-5">
@@ -475,6 +655,7 @@ export default function Calls() {
                 <button
                   type="button"
                   onClick={handleDeclineCall}
+                  disabled={isBusy}
                   className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2 font-medium text-red-200 hover:bg-red-500/20"
                 >
                   Decline
@@ -483,17 +664,26 @@ export default function Calls() {
             </div>
           )}
 
-          {callState && (
-            <button
-              type="button"
-              onClick={handleEndCall}
-              className="mt-6 flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-5 py-3 font-medium text-red-200 hover:bg-red-500/20"
-            >
-              <PhoneOff size={18} /> End Call
-            </button>
+          {activeCall && (
+            <div className="mt-6 flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={handleToggleMute}
+                className="flex items-center gap-2 rounded-2xl border border-neutral-700 bg-neutral-800 px-5 py-3 font-medium text-neutral-100 hover:bg-neutral-700"
+              >
+                {isMuted ? <MicOff size={18} /> : <Mic size={18} />} {isMuted ? 'Unmute' : 'Mute'}
+              </button>
+              <button
+                type="button"
+                onClick={handleEndCall}
+                className="flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-5 py-3 font-medium text-red-200 hover:bg-red-500/20"
+              >
+                <PhoneOff size={18} /> End Call
+              </button>
+            </div>
           )}
 
-          <audio ref={remoteAudioRef} autoPlay />
+          <audio ref={remoteAudioRef} autoPlay playsInline />
         </section>
       </div>
     </div>
